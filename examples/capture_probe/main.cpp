@@ -1,12 +1,41 @@
 #include "wayland_capture_session.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+namespace {
+
+const char* stateName(WaylandCaptureSession::State state) {
+    using State = WaylandCaptureSession::State;
+
+    switch (state) {
+    case State::Idle:
+        return "Idle";
+
+    case State::Starting:
+        return "Starting";
+
+    case State::Streaming:
+        return "Streaming";
+
+    case State::Paused:
+        return "Paused";
+
+    case State::Stopping:
+        return "Stopping";
+
+    case State::Error:
+        return "Error";
+    }
+
+    return "Unknown";
+}
 
 bool saveFrameAsPpm(const WaylandCaptureSession::Frame& frame, const char* path) {
     if (frame.data == nullptr || frame.width == 0 || frame.height == 0 ||
@@ -25,7 +54,7 @@ bool saveFrameAsPpm(const WaylandCaptureSession::Frame& frame, const char* path)
     std::ofstream output(path, std::ios::binary);
 
     if (!output) {
-        std::cerr << "failed to open: " << path << '\n';
+        std::cerr << "failed to open output file: " << path << '\n';
         return false;
     }
 
@@ -42,7 +71,6 @@ bool saveFrameAsPpm(const WaylandCaptureSession::Frame& frame, const char* path)
 
             std::uint8_t* destinationPixel = rgbRow.data() + static_cast<std::size_t>(x) * 3;
 
-            // PipeWire 输出 BGRA/BGRx，PPM 需要 RGB。
             destinationPixel[0] = sourcePixel[2];
             destinationPixel[1] = sourcePixel[1];
             destinationPixel[2] = sourcePixel[0];
@@ -57,110 +85,84 @@ bool saveFrameAsPpm(const WaylandCaptureSession::Frame& frame, const char* path)
         }
     }
 
-    std::cout << "saved frame: " << path << '\n';
+    std::cout << "saved first frame: " << path << '\n';
 
     return true;
 }
 
+} // namespace
+
 int main() {
-    // 注意：capture 在循环外创建。
-    // 两轮测试使用的是同一个对象。
     WaylandCaptureSession capture;
 
+    std::atomic<std::uint64_t> frameCount{0};
+    std::atomic<bool> frameSaved{false};
+
     WaylandCaptureSession::Config config;
-    config.sourceType = WaylandCaptureSession::SourceType::Window;
+
+    config.sourceType = WaylandCaptureSession::SourceType::Monitor;
+
     config.cursorMode = WaylandCaptureSession::CursorMode::Embedded;
 
-    for (int round = 1; round <= 2; ++round) {
-        std::atomic<std::uint64_t> frameCount{0};
-        std::atomic<bool> frameSaved{false};
+    WaylandCaptureSession::Callbacks callbacks;
 
-        WaylandCaptureSession::Callbacks callbacks;
-
-        callbacks.onFrame = [&frameCount, &frameSaved](const WaylandCaptureSession::Frame& frame) {
-            if (!frameSaved.exchange(true)) {
-                if (!saveFrameAsPpm(frame, "captured_frame.ppm")) {
-                    std::cerr << "failed to save captured frame\n";
-                }
-            }
-
-            const std::uint64_t count = ++frameCount;
-
-            if (count == 1 || count % 60 == 0) {
-                std::cout << "callback frame: " << count << ", size: " << frame.width << 'x'
-                          << frame.height << ", pts: " << frame.ptsNs << " ns"
-                          << ", sequence: " << frame.sequence << '\n';
-            }
-        };
-
-        callbacks.onStateChanged = [](WaylandCaptureSession::State state) {
-            std::cout << "state: " << static_cast<int>(state) << '\n';
-        };
-
-        callbacks.onError = [](std::string_view message) {
-            std::cerr << "error: " << message << '\n';
-        };
-
-        std::cout << "\n=== capture round " << round << " ===\n";
-
-        if (!capture.start(config, std::move(callbacks))) {
-            std::cerr << "failed to start capture round " << round << '\n';
-
-            return 1;
+    callbacks.onFrame = [&frameCount, &frameSaved](const WaylandCaptureSession::Frame& frame) {
+        if (!frameSaved.exchange(true)) {
+            saveFrameAsPpm(frame, "captured_frame.ppm");
         }
 
-        WaylandCaptureSession::Callbacks duplicateCallbacks;
+        const std::uint64_t count = ++frameCount;
 
-        const bool duplicateStartResult = capture.start(config, std::move(duplicateCallbacks));
-
-        std::cout << "duplicate start result: " << (duplicateStartResult ? "true" : "false")
-                  << '\n';
-
-        std::cout << "commands:\n"
-                  << "  p: pause\n"
-                  << "  r: resume\n"
-                  << "  q: stop current round\n";
-
-        char command = '\0';
-
-        while (std::cin >> command) {
-            if (command == 'p') {
-                capture.pause();
-
-                std::cout << "pause requested\n";
-
-                continue;
-            }
-
-            if (command == 'r') {
-                capture.resume();
-
-                std::cout << "resume requested\n";
-
-                continue;
-            }
-
-            if (command == 'q') {
-                break;
-            }
-
-            std::cout << "unknown command: " << command << '\n';
+        if (count == 1 || count % 60 == 0) {
+            std::cout << "frame: " << count << ", size: " << frame.width << 'x' << frame.height
+                      << ", stride: " << frame.rowStrideInBytes << ", pts: " << frame.ptsNs << " ns"
+                      << ", sequence: " << frame.sequence << '\n';
         }
+    };
 
-        // 即使第一轮已经因为用户取消进入 Error，
-        // 仍然需要 stop() 来 join 工作线程并恢复到 Idle。
-        capture.stop();
+    callbacks.onStateChanged = [](WaylandCaptureSession::State state) {
+        std::cout << "state: " << stateName(state) << '\n';
+    };
 
-        std::cout << "first stop completed\n";
+    callbacks.onError = [](std::string_view message) {
+        std::cerr << "capture error: " << message << '\n';
+    };
 
-        capture.stop();
-
-        std::cout << "second stop completed\n";
-
-        std::cout << "round " << round << " stopped"
-                  << ", total frames: " << frameCount.load() << '\n';
+    if (!capture.start(config, std::move(callbacks))) {
+        std::cerr << "failed to start capture\n";
+        return 1;
     }
 
-    std::cout << "all rounds completed\n";
+    std::cout << "commands:\n"
+              << "  p: pause\n"
+              << "  r: resume\n"
+              << "  q: quit\n";
+
+    char command = '\0';
+
+    while (std::cin >> command) {
+        switch (command) {
+        case 'p':
+            capture.pause();
+            break;
+
+        case 'r':
+            capture.resume();
+            break;
+
+        case 'q':
+            capture.stop();
+
+            std::cout << "total frames: " << frameCount.load() << '\n';
+
+            return 0;
+
+        default:
+            std::cout << "unknown command: " << command << '\n';
+            break;
+        }
+    }
+
+    capture.stop();
     return 0;
 }
